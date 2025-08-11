@@ -326,6 +326,8 @@ app.post('/api/line-webhook', async (req, res) => {
               quickReply: { items: quickReplies },
             },
           ])
+
+          continue
         } else {
           await supabase.from('line_message_sessions').update({ status: 'completed' }).eq('id', lastSession.id)
           await replyToLine(replyToken, [{ type: 'text', text: '了解しました。また何かあればお知らせください。' }])
@@ -337,25 +339,69 @@ app.post('/api/line-webhook', async (req, res) => {
         if (text.startsWith('選択:')) {
           const selectedPersonId = text.replace('選択:', '').trim()
 
+          // ここで選択後に「一番最初のメッセージ内容」と「これに対して作成しますか？はい/いいえ」メッセージを送る処理へ変更
+
+          // セッション更新：選択した人物IDと新ステータス
           await supabase
             .from('line_message_sessions')
             .update({
               selected_person_id: selectedPersonId,
-              status: 'waiting_for_input_text',
-              message_text: text,
+              status: 'waiting_for_confirmation',
             })
             .eq('id', lastSession.id)
 
+          // 「一番最初のメッセージ内容」と「これに対して作成しますか？」のQuickReply送信
           await replyToLine(replyToken, [
             {
               type: 'text',
-              text: 'どんな内容に対して作成しますか？メッセージを入力してください。',
+              text: `一番最初のメッセージ内容:\n${lastSession.message_text}\n\nこれに対して作成しますか？`,
+              quickReply: {
+                items: [
+                  { type: 'action', action: { type: 'message', label: 'はい', text: 'はい' } },
+                  { type: 'action', action: { type: 'message', label: 'いいえ', text: 'いいえ' } },
+                ],
+              },
             },
           ])
+
+          continue
         } else {
           await replyToLine(replyToken, [{ type: 'text', text: '人物選択は候補からお選びください。' }])
         }
         continue
+      }
+
+      if (lastSession.status === 'waiting_for_confirmation') {
+        if (text === 'はい') {
+          // そのまま返信生成へ（waiting_for_generated_replyへ）
+          await supabase
+            .from('line_message_sessions')
+            .update({ status: 'waiting_for_generated_reply' })
+            .eq('id', lastSession.id)
+
+          // 返信生成API呼び出しは下の waiting_for_generated_reply で実装
+          // ここでは「これから返信作るよ」と軽く伝えてもよい
+          await replyToLine(replyToken, [{ type: 'text', text: '返信生成を開始します。しばらくお待ちください...' }])
+
+          continue
+        } else if (text === 'いいえ') {
+          // メッセージ入力を促す（waiting_for_input_textへ）
+          await supabase
+            .from('line_message_sessions')
+            .update({ status: 'waiting_for_input_text' })
+            .eq('id', lastSession.id)
+
+          await replyToLine(replyToken, [
+            { type: 'text', text: 'どんな内容に対して作成しますか？メッセージを入力してください。' },
+          ])
+
+          continue
+        } else {
+          await replyToLine(replyToken, [
+            { type: 'text', text: '「はい」か「いいえ」でお答えください。' },
+          ])
+          continue
+        }
       }
 
       if (lastSession.status === 'waiting_for_input_text') {
@@ -419,69 +465,106 @@ app.post('/api/line-webhook', async (req, res) => {
         continue
       }
 
-      if (lastSession.status === 'waiting_for_actual_reply_text') {
-        // ここで最新のセッションを再取得して input_text 等を正しく取得する
-        const { data: freshSessions, error: freshSessionError } = await supabase
-          .from('line_message_sessions')
-          .select('*')
-          .eq('id', lastSession.id)
-          .limit(1)
+      if (lastSession.status === 'waiting_for_generated_reply') {
+        // ここに返信生成API呼び出し処理を追加して、返信例を送るだけに最小限修正
 
-        if (freshSessionError) {
-          console.error('Error fetching fresh session:', freshSessionError)
+        const { data: replyProfiles, error: replyProfilesError } = await supabase
+          .from('reply_profiles')
+          .select('input_text, reply_text')
+          .eq('person_id', lastSession.selected_person_id)
+          .order('created_at', { ascending: false })
+          .limit(10)
+
+        if (replyProfilesError) {
+          console.error('Supabase reply_profiles fetch error:', replyProfilesError)
           await replyToLine(replyToken, [{ type: 'text', text: 'システムエラーが発生しました。' }])
           continue
         }
 
-        const freshSession = freshSessions?.[0]
-        if (!freshSession) {
-          await replyToLine(replyToken, [{ type: 'text', text: 'セッションが見つかりません。' }])
+        // 生成元のテキストをちゃんと取る（waiting_for_input_textの場合と同様に）
+        const inputText = lastSession.input_text || lastSession.message_text || ''
+
+        const openaiResponse = await fetch(VERCEL_API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            inputText,
+            replyProfiles: replyProfiles || [],
+          }),
+        })
+
+        const responseText = await openaiResponse.text()
+        console.log('Vercel API raw response:', responseText)
+
+        let openaiResult
+        try {
+          openaiResult = JSON.parse(responseText)
+        } catch (e) {
+          console.error('Failed to parse JSON from Vercel API:', e)
+          await replyToLine(replyToken, [{ type: 'text', text: '返信生成APIの応答が不正です。' }])
           continue
         }
 
-        await supabase.from('reply_profiles').insert([
-          {
-            input_text: freshSession.input_text,
-            reply_text: text,
-            person_id: freshSession.selected_person_id,
-            user_id: userProfile.user_id,
-            created_at: new Date().toISOString(),
-          },
-        ])
+        const generatedReply = openaiResult.reply || '返信生成に失敗しました。'
 
         await supabase
           .from('line_message_sessions')
-          .update({ status: 'completed' })
+          .update({ generated_reply: generatedReply, status: 'waiting_for_actual_reply_text' })
           .eq('id', lastSession.id)
 
         await replyToLine(replyToken, [
-          { type: 'text', text: 'メッセージを保存しました。ありがとうございました。' },
-          // {
-          //   type: 'text',
-          //   text: '続けて返信生成を行いますか？「はい」か「いいえ」で答えてください。',
-          //   quickReply: {
-          //     items: [
-          //       { type: 'action', action: { type: 'message', label: 'はい', text: 'はい' } },
-          //       { type: 'action', action: { type: 'message', label: 'いいえ', text: 'いいえ' } },
-          //     ],
-          //   },
-          // },
+          { type: 'text', text: `返信例:\n${generatedReply}` },
+          { type: 'text', text: '実際に送るメッセージを送ってください。' },
         ])
 
         continue
       }
 
-      // それ以外は一応待機メッセージ
-      await replyToLine(replyToken, [{ type: 'text', text: '現在処理中です。少々お待ちください。' }])
+      if (lastSession.status === 'waiting_for_actual_reply_text') {
+        // 実際に送るメッセージを受け取ったら、返信例とセットでreply_profilesに保存
+        const generatedReply = lastSession.generated_reply || ''
+        const inputText = lastSession.input_text || lastSession.message_text || ''
+
+        // reply_profiles保存
+        const { error: insertReplyError } = await supabase.from('reply_profiles').insert([
+          {
+            user_id: userProfile.user_id,
+            person_id: lastSession.selected_person_id,
+            input_text: inputText,
+            reply_text: text,
+            created_at: new Date().toISOString(),
+          },
+        ])
+
+        if (insertReplyError) {
+          console.error('Failed to insert reply_profile:', insertReplyError)
+          await replyToLine(replyToken, [{ type: 'text', text: '返信ペアの保存に失敗しました。' }])
+          continue
+        }
+
+        // セッション完了に更新
+        await supabase
+          .from('line_message_sessions')
+          .update({ status: 'completed' })
+          .eq('id', lastSession.id)
+
+        await replyToLine(replyToken, [{ type: 'text', text: 'メッセージを保存しました。ありがとうございました！' }])
+        continue
+      }
+
+      // それ以外はエラーメッセージ
+      await replyToLine(replyToken, [
+        { type: 'text', text: '申し訳ありませんが、現在その操作はできません。' },
+      ])
     }
 
-    return res.status(200).send('OK')
-  } catch (err) {
-    console.error('Webhook error:', err)
-    return res.status(500).send('Internal Server Error')
+    res.status(200).send('OK')
+  } catch (error) {
+    console.error('Unhandled error:', error)
+    res.status(500).send('Internal Server Error')
   }
 })
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`)
+  console.log(`Server running on port ${PORT}`)
 })
